@@ -1,0 +1,145 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package tests
+
+import (
+	"strings"
+	"testing"
+
+	"k8s.io/apimachinery/pkg/types"
+
+	"sigs.k8s.io/gateway-api/conformance/utils/http"
+	"sigs.k8s.io/gateway-api/conformance/utils/kubernetes"
+	confsuite "sigs.k8s.io/gateway-api/conformance/utils/suite"
+	"sigs.k8s.io/gateway-api/pkg/features"
+)
+
+func init() {
+	ConformanceTests = append(ConformanceTests, HTTPRouteExternalAuthGRPCForwardBody)
+}
+
+// HTTPRouteExternalAuthGRPCForwardBody verifies the forwardBody.maxSize behaviour of
+// the gRPC ExternalAuth filter. ForwardBody is a top-level field of HTTPExternalAuthFilter
+// and applies to both the HTTP and GRPC protocols. When using gRPC, the body is carried in
+// CheckRequest.attributes.request.http.body (or raw_body). The manifest defines two rules:
+//
+//   - Rule 1 (maxSize=100): bodies within the limit are placed in the CheckRequest and the
+//     request succeeds; bodies exceeding it must be rejected with 4xx. The auth server echoes
+//     the received body size as X-Auth-Received-Body-Size in OkHttpResponse.Headers; the
+//     gateway adds it to the upstream request so the backend can confirm the size.
+//
+//   - Rule 2 (maxSize=0): the body and raw_body fields of the CheckRequest must be empty.
+//     The gateway must not reject requests solely because they carry a body.
+//     X-Auth-Received-Body-Size: 0 confirms the body was withheld — observable via the
+//     upstream request on the allowed path and via the client 403 response on the denied path.
+//
+// NOTE: GEP-1494 has an unresolved inconsistency between the ExternalAuthFilter.ForwardBody
+// field comment (which says oversized bodies are rejected with 4xx) and the
+// ForwardBodyConfig.MaxSize comment (which says the body is truncated). The over-size test
+// therefore accepts both 413 and 403. Implementations that truncate will return 200 and fail
+// that case; that is expected until the spec ambiguity is resolved.
+// See https://github.com/kubernetes-sigs/gateway-api/pull/4001#discussion_r2291405746.
+var HTTPRouteExternalAuthGRPCForwardBody = confsuite.ConformanceTest{
+	ShortName:   "HTTPRouteExternalAuthGRPCForwardBody",
+	Description: "An HTTPRoute ExternalAuth gRPC filter honours forwardBody.maxSize: bodies within the limit are forwarded and confirmed via X-Auth-Received-Body-Size; bodies over the limit are rejected with 4xx; maxSize=0 withholds the body entirely",
+	Manifests:   []string{"tests/httproute-external-auth-grpc-forward-body.yaml"},
+	Features: []features.FeatureName{
+		features.SupportGateway,
+		features.SupportHTTPRoute,
+		features.SupportHTTPRouteExternalAuth,
+		features.SupportHTTPRouteExternalAuthGRPC,
+		features.SupportHTTPRouteExternalAuthForwardBody,
+	},
+	Test: func(t *testing.T, suite *confsuite.ConformanceTestSuite) {
+		ns := confsuite.InfrastructureNamespace
+		routeNN := types.NamespacedName{Name: "external-auth-grpc-forward-body", Namespace: ns}
+		gwNN := types.NamespacedName{Name: "same-namespace", Namespace: ns}
+		gwAddr := kubernetes.GatewayAndHTTPRoutesMustBeAccepted(t, suite.Client, suite.TimeoutConfig, suite.ControllerName, kubernetes.NewGatewayRef(gwNN), routeNN)
+		kubernetes.HTTPRouteMustHaveResolvedRefsConditionsTrue(t, suite.Client, suite.TimeoutConfig, routeNN, gwNN)
+
+		testCases := []http.ExpectedResponse{
+			{
+				TestCaseName: "maxSize=100: body within limit (10 bytes) should be forwarded to the auth server",
+				Request: http.Request{
+					Method: "POST",
+					Path:   "/grpc/allowed/forward-body",
+					Body:   "0123456789",
+				},
+				ExpectedRequest: &http.ExpectedRequest{
+					Request: http.Request{
+						Path: "/grpc/allowed/forward-body",
+						Headers: map[string]string{
+							"X-Auth-Received-Body-Size": "10",
+						},
+					},
+				},
+				Backend:   confsuite.InfraBackendServiceNameV1,
+				Namespace: ns,
+				Response:  http.Response{StatusCode: 200},
+			},
+			{
+				TestCaseName: "maxSize=100: body exceeding limit (200 bytes) should be rejected with 4xx",
+				Request: http.Request{
+					Method: "POST",
+					Path:   "/grpc/allowed/forward-body",
+					Body:   strings.Repeat("x", 200),
+				},
+				Response: http.Response{StatusCodes: []int{413, 403}},
+			},
+			{
+				TestCaseName: "maxSize=0: allowed request with body must not be rejected and auth server must receive zero body bytes",
+				Request: http.Request{
+					Method: "POST",
+					Path:   "/grpc/allowed/forward-body-zero",
+					Body:   strings.Repeat("x", 200),
+				},
+				ExpectedRequest: &http.ExpectedRequest{
+					Request: http.Request{
+						Path: "/grpc/allowed/forward-body-zero",
+						Headers: map[string]string{
+							"X-Auth-Received-Body-Size": "0",
+						},
+					},
+				},
+				Backend:   confsuite.InfraBackendServiceNameV1,
+				Namespace: ns,
+				Response:  http.Response{StatusCode: 200},
+			},
+			{
+				TestCaseName: "maxSize=0: denied request with body must still be denied and auth server must receive zero body bytes",
+				Request: http.Request{
+					Method: "POST",
+					Path:   "/grpc/denied/forward-body-zero",
+					Body:   strings.Repeat("x", 200),
+				},
+				Response: http.Response{
+					StatusCode: 403,
+					Headers: map[string]string{
+						"X-Auth-Received-Body-Size": "0",
+					},
+				},
+			},
+		}
+		for i := range testCases {
+			tc := testCases[i]
+			t.Run(tc.GetTestCaseName(i), func(t *testing.T) {
+				t.Parallel()
+				http.MakeRequestAndExpectEventuallyConsistentResponse(t, suite.RoundTripper, suite.TimeoutConfig, gwAddr, tc)
+			})
+		}
+	},
+}
